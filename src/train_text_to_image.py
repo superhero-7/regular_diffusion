@@ -41,13 +41,14 @@ from transformers import CLIPTextModel, CLIPTokenizer
 from transformers.utils import ContextManagers
 
 import diffusers
-from diffusers import AutoencoderKL, DDPMScheduler, StableDiffusionPipeline, UNet2DConditionModel
+from diffusers import AutoencoderKL, DDPMScheduler, StableDiffusionPipeline
 from diffusers.optimization import get_scheduler
 from diffusers.training_utils import EMAModel, compute_snr
 from diffusers.utils import check_min_version, deprecate, is_wandb_available, make_image_grid
 from diffusers.utils.import_utils import is_xformers_available
-from dataset import LayoutDataset, collate_fn
+from dataset import LayoutDataset, MaskDataset, collate_fn, tmp_collate_fn
 
+from utils import compute_ca_loss
 
 if is_wandb_available():
     import wandb
@@ -478,6 +479,23 @@ def parse_args():
             " more information see https://huggingface.co/docs/accelerate/v0.17.0/en/package_reference/accelerator#accelerate.Accelerator"
         ),
     )
+    parser.add_argument(
+        "--enable_mar_loss",
+        action="store_true",
+        help="Whether or not to use the MAR loss.",
+    )
+    parser.add_argument(
+        "--mar_loss_weight",
+        type=float,
+        default=1.0,
+        help="The weight of the MAR loss.",
+    )
+    parser.add_argument(
+        "--attn_res",
+        type=int,
+        default=16,
+        help="The resolution of the attention maps.",
+    )
 
     args = parser.parse_args()
     env_local_rank = int(os.environ.get("LOCAL_RANK", -1))
@@ -497,6 +515,11 @@ def parse_args():
 
 def main():
     args = parse_args()
+    
+    if args.enable_mar_loss:
+        from my_model.unet_2d_condition import UNet2DConditionModel
+    else:
+        from diffusers import UNet2DConditionModel
 
     if args.non_ema_revision is not None:
         deprecate(
@@ -584,6 +607,9 @@ def main():
     unet = UNet2DConditionModel.from_pretrained(
         args.pretrained_model_name_or_path, subfolder="unet", revision=args.non_ema_revision
     )
+    # 把Attention processor换成原始的
+    if args.enable_mar_loss:
+        unet.set_default_attn_processor()
 
     # Freeze vae and text_encoder and set unet to trainable
     vae.requires_grad_(False)
@@ -776,22 +802,40 @@ def main():
     #     return {"pixel_values": pixel_values, "input_ids": input_ids}
 
     # 自己重写一下dataset赛到这里就可以了；
-    train_dataset = LayoutDataset(
-        args.train_data_dir,
-        resolution=args.resolution,
-        center_crop=args.center_crop,
-        random_flip=args.random_flip,
-        tokenizer=tokenizer,
-    )
+    if args.enable_mar_loss:
+        train_dataset = MaskDataset(
+            args.train_data_dir,
+            resolution=args.resolution,
+            attn_res=args.attn_res,
+            center_crop=args.center_crop,
+            random_flip=args.random_flip,
+            tokenizer=tokenizer,
+        )
+        
+        train_dataloader = torch.utils.data.DataLoader(
+            train_dataset,
+            shuffle=True,
+            collate_fn=tmp_collate_fn,
+            batch_size=args.train_batch_size,
+            num_workers=args.dataloader_num_workers,
+        )
+    else:
+        train_dataset = LayoutDataset(
+            args.train_data_dir,
+            resolution=args.resolution,
+            center_crop=args.center_crop,
+            random_flip=args.random_flip,
+            tokenizer=tokenizer,
+        )
 
-    # DataLoaders creation:
-    train_dataloader = torch.utils.data.DataLoader(
-        train_dataset,
-        shuffle=True,
-        collate_fn=collate_fn,
-        batch_size=args.train_batch_size,
-        num_workers=args.dataloader_num_workers,
-    )
+        # DataLoaders creation:
+        train_dataloader = torch.utils.data.DataLoader(
+            train_dataset,
+            shuffle=True,
+            collate_fn=collate_fn,
+            batch_size=args.train_batch_size,
+            num_workers=args.dataloader_num_workers,
+        )
 
     # Scheduler and math around the number of training steps.
     overrode_max_train_steps = False
@@ -895,6 +939,7 @@ def main():
     for epoch in range(first_epoch, args.num_train_epochs):
         train_loss = 0.0
         for step, batch in enumerate(train_dataloader):
+            
             with accelerator.accumulate(unet):
                 # Convert images to latent space
                 latents = vae.encode(batch["pixel_values"].to(weight_dtype)).latent_dist.sample()
@@ -922,6 +967,10 @@ def main():
                     noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
 
                 # Get the text embedding for conditioning
+                # 这样写有点不优雅，我写个tmp collate_fn来解决
+                # if args.enable_mar_loss:
+                #     encoder_hidden_states = text_encoder(torch.squeeze(batch["input_ids"]))[0]
+                # else:
                 encoder_hidden_states = text_encoder(batch["input_ids"])[0]
 
                 # Get the target for loss depending on the prediction type
@@ -937,9 +986,13 @@ def main():
                     raise ValueError(f"Unknown prediction type {noise_scheduler.config.prediction_type}")
 
                 # Predict the noise residual and compute loss
-                model_pred = unet(noisy_latents, timesteps, encoder_hidden_states).sample
-
-                # TODO: add support for MASK Regulation loss functions
+                if args.enable_mar_loss:
+                    model_pred, attn_down, attn_mid, attn_up = unet(noisy_latents, timesteps, encoder_hidden_states)
+                    model_pred = model_pred.sample
+                else:
+                    model_pred = unet(noisy_latents, timesteps, encoder_hidden_states).sample
+                    
+                
                 if args.snr_gamma is None:
                     loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
                 else:
@@ -958,6 +1011,16 @@ def main():
                     loss = loss.mean(dim=list(range(1, len(loss.shape)))) * mse_loss_weights
                     loss = loss.mean()
 
+                # import pdb;pdb.set_trace()
+                # TODO: add support for MASK Regulation loss functions
+                if args.enable_mar_loss:
+                    loss += args.mar_loss_weight * compute_ca_loss(attn_down, 
+                                                                   attn_up, 
+                                                                   batch["torch_mask_images"],
+                                                                   batch["attn_map_ids"],
+                                                                   args.attn_res)
+                    
+                    
                 # Gather the losses across all processes for logging (if we use distributed training).
                 avg_loss = accelerator.gather(loss.repeat(args.train_batch_size)).mean()
                 train_loss += avg_loss.item() / args.gradient_accumulation_steps
